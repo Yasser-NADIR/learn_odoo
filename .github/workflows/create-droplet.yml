@@ -1,0 +1,280 @@
+name: Create DigitalOcean Droplet
+
+on:
+  workflow_dispatch:
+    inputs:
+      droplet_name:
+        description: 'Name of the droplet'
+        required: true
+        default: 'odoo-production'
+      droplet_size:
+        description: 'Droplet size'
+        required: true
+        default: 's-2vcpu-4gb'
+        type: choice
+        options:
+          - 's-1vcpu-1gb'
+          - 's-1vcpu-2gb'
+          - 's-2vcpu-2gb'
+          - 's-2vcpu-4gb'
+          - 's-4vcpu-8gb'
+      droplet_region:
+        description: 'Droplet region'
+        required: true
+        default: 'nyc1'
+        type: choice
+        options:
+          - 'nyc1'
+          - 'nyc3'
+          - 'sfo3'
+          - 'ams3'
+          - 'sgp1'
+          - 'lon1'
+          - 'fra1'
+          - 'tor1'
+
+jobs:
+  create-droplet:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Check if droplet already exists
+        id: check_droplet
+        run: |
+          DROPLET_NAME="${{ github.event.inputs.droplet_name }}"
+          
+          # Get list of droplets with matching name
+          EXISTING_DROPLET=$(doctl compute droplet list \
+            --format Name,ID,Status,PublicIPv4,Tags \
+            --no-header \
+            | grep "^${DROPLET_NAME} " || true)
+          
+          if [ -n "$EXISTING_DROPLET" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            DROPLET_ID=$(echo "$EXISTING_DROPLET" | awk '{print $2}')
+            DROPLET_IP=$(echo "$EXISTING_DROPLET" | awk '{print $4}')
+            echo "droplet_id=$DROPLET_ID" >> $GITHUB_OUTPUT
+            echo "droplet_ip=$DROPLET_IP" >> $GITHUB_OUTPUT
+            echo "::warning::Droplet '$DROPLET_NAME' already exists (ID: $DROPLET_ID, IP: $DROPLET_IP)"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Droplet '$DROPLET_NAME' does not exist. Proceeding with creation..."
+          fi
+
+      - name: Setup SSH key for droplet
+        if: steps.check_droplet.outputs.exists == 'false'
+        id: setup_ssh_key
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          SSH_KEY_NAME="github-actions-deploy-key"
+          
+          # Save public key from environment variable to temporary file
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ./temp_pub_key
+          
+          # Check if this SSH key already exists in DigitalOcean
+          EXISTING_KEY_ID=$(doctl compute ssh-key list \
+            --format Name,ID,FingerPrint \
+            --no-header \
+            | grep "^$SSH_KEY_NAME " \
+            | awk '{print $2}' || true)
+          
+          if [ -n "$EXISTING_KEY_ID" ]; then
+            echo "✅ Using existing SSH key from DigitalOcean: $SSH_KEY_NAME (ID: $EXISTING_KEY_ID)"
+            echo "ssh_key_id=$EXISTING_KEY_ID" >> $GITHUB_OUTPUT
+          else
+            echo "📤 Uploading SSH key to DigitalOcean as: $SSH_KEY_NAME"
+            # Upload public key to DigitalOcean
+            SSH_KEY_ID=$(doctl compute ssh-key import "$SSH_KEY_NAME" \
+              --public-key-file ./temp_pub_key \
+              --format ID \
+              --no-header)
+            
+            echo "✅ SSH key uploaded successfully (ID: $SSH_KEY_ID)"
+            echo "ssh_key_id=$SSH_KEY_ID" >> $GITHUB_OUTPUT
+          fi
+          
+          # Clean up temporary public key file
+          rm -f ./temp_pub_key
+
+      - name: Create cloud-init script
+        if: steps.check_droplet.outputs.exists == 'false'
+        run: |
+          cat > cloud-init.yaml <<'EOF'
+          #cloud-config
+          package_update: true
+          package_upgrade: true
+          
+          packages:
+            - apt-transport-https
+            - ca-certificates
+            - curl
+            - gnupg
+            - lsb-release
+            - ufw
+          
+          runcmd:
+            # Install Docker (includes Compose V2 plugin)
+            - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+            - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            - apt-get update
+            - apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            
+            # Start and enable Docker
+            - systemctl start docker
+            - systemctl enable docker
+            
+            # Add default user to docker group
+            - usermod -aG docker root
+            
+            # Create symlink for backwards compatibility (optional)
+            # Allows 'docker-compose' (hyphen) to work as 'docker compose' (space)
+            - ln -sf /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+            
+            # Configure UFW firewall
+            - ufw default deny incoming
+            - ufw default allow outgoing
+            - ufw allow ssh
+            - ufw allow 80/tcp
+            - ufw allow 443/tcp
+            - ufw allow 8069/tcp
+            - ufw --force enable
+            
+            # Create marker file to indicate setup completion
+            - touch /var/log/cloud-init-complete
+          
+          final_message: "Docker installation completed successfully!"
+          EOF
+
+      - name: Create DigitalOcean Droplet
+        if: steps.check_droplet.outputs.exists == 'false'
+        id: create_droplet
+        run: |
+          DROPLET_NAME="${{ github.event.inputs.droplet_name }}"
+          DROPLET_SIZE="${{ github.event.inputs.droplet_size }}"
+          DROPLET_REGION="${{ github.event.inputs.droplet_region }}"
+          SSH_KEY_ID="${{ steps.setup_ssh_key.outputs.ssh_key_id }}"
+          
+          # Create droplet with cloud-init
+          DROPLET_INFO=$(doctl compute droplet create "$DROPLET_NAME" \
+            --size "$DROPLET_SIZE" \
+            --region "$DROPLET_REGION" \
+            --image ubuntu-24-04-x64 \
+            --ssh-keys "$SSH_KEY_ID" \
+            --tag-names "odoo,production,managed-by-github" \
+            --user-data-file cloud-init.yaml \
+            --enable-monitoring \
+            --enable-ipv6 \
+            --format ID,Name,PublicIPv4,Status \
+            --no-header \
+            --wait)
+          
+          DROPLET_ID=$(echo "$DROPLET_INFO" | awk '{print $1}')
+          DROPLET_IP=$(echo "$DROPLET_INFO" | awk '{print $3}')
+          
+          echo "droplet_id=$DROPLET_ID" >> $GITHUB_OUTPUT
+          echo "droplet_ip=$DROPLET_IP" >> $GITHUB_OUTPUT
+          
+          echo "✅ Droplet created successfully!"
+          echo "Droplet ID: $DROPLET_ID"
+          echo "Droplet IP: $DROPLET_IP"
+
+      - name: Wait for Docker installation
+        if: steps.check_droplet.outputs.exists == 'false'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          DROPLET_IP="${{ steps.create_droplet.outputs.droplet_ip }}"
+          
+          # Save private key from environment variable to file
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ./droplet_key
+          chmod 600 ./droplet_key
+          
+          echo "Waiting for droplet to be ready and Docker to be installed..."
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+            
+            # Check if we can connect and if cloud-init is complete
+            if ssh -i ./droplet_key \
+                   -o StrictHostKeyChecking=no \
+                   -o UserKnownHostsFile=/dev/null \
+                   -o ConnectTimeout=10 \
+                   root@$DROPLET_IP \
+                   "test -f /var/log/cloud-init-complete && docker --version" 2>/dev/null; then
+              echo "✅ Docker is installed and ready!"
+              break
+            fi
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "::error::Failed to verify Docker installation after $MAX_ATTEMPTS attempts"
+              exit 1
+            fi
+            
+            sleep 20
+          done
+          
+          # Clean up private key from runner
+          rm -f ./droplet_key
+
+      - name: Display droplet information
+        if: always()
+        run: |
+          if [ "${{ steps.check_droplet.outputs.exists }}" == "true" ]; then
+            echo "## ⚠️ Droplet Already Exists" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Name:** ${{ github.event.inputs.droplet_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "**ID:** ${{ steps.check_droplet.outputs.droplet_id }}" >> $GITHUB_STEP_SUMMARY
+            echo "**IP:** ${{ steps.check_droplet.outputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No new droplet was created." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ✅ Droplet Created Successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Name:** ${{ github.event.inputs.droplet_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "**ID:** ${{ steps.create_droplet.outputs.droplet_id }}" >> $GITHUB_STEP_SUMMARY
+            echo "**IP:** ${{ steps.create_droplet.outputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Size:** ${{ github.event.inputs.droplet_size }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Region:** ${{ github.event.inputs.droplet_region }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### SSH Access" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "ssh root@${{ steps.create_droplet.outputs.droplet_ip }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Verify Docker Installation" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "ssh root@${{ steps.create_droplet.outputs.droplet_ip }} 'docker --version && docker-compose --version'" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Tags:** odoo, production, managed-by-github" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Save droplet info to repository (optional)
+        if: steps.check_droplet.outputs.exists == 'false'
+        run: |
+          mkdir -p infrastructure
+          cat > infrastructure/droplet-info.json <<EOF
+          {
+            "droplet_name": "${{ github.event.inputs.droplet_name }}",
+            "droplet_id": "${{ steps.create_droplet.outputs.droplet_id }}",
+            "droplet_ip": "${{ steps.create_droplet.outputs.droplet_ip }}",
+            "droplet_size": "${{ github.event.inputs.droplet_size }}",
+            "droplet_region": "${{ github.event.inputs.droplet_region }}",
+            "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "tags": ["odoo", "production", "managed-by-github"]
+          }
+          EOF
+          
+          echo "Droplet information saved to infrastructure/droplet-info.json"
