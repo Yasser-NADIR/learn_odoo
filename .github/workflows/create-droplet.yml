@@ -32,10 +32,43 @@ on:
           - 'lon1'
           - 'fra1'
           - 'tor1'
+  
+  # Allow this workflow to be called by other workflows
+  workflow_call:
+    inputs:
+      droplet_name:
+        description: 'Name of the droplet'
+        required: true
+        type: string
+      droplet_size:
+        description: 'Droplet size'
+        required: true
+        type: string
+      droplet_region:
+        description: 'Droplet region'
+        required: true
+        type: string
+    outputs:
+      droplet_id:
+        description: "ID of the created droplet"
+        value: ${{ jobs.create-droplet.outputs.droplet_id }}
+      droplet_ip:
+        description: "IP address of the created droplet"
+        value: ${{ jobs.create-droplet.outputs.droplet_ip }}
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN:
+        required: true
+      SSH_PUBLIC_KEY:
+        required: true
+      SSH_PRIVATE_KEY:
+        required: true
 
 jobs:
   create-droplet:
     runs-on: ubuntu-latest
+    outputs:
+      droplet_id: ${{ steps.create_droplet.outputs.droplet_id }}
+      droplet_ip: ${{ steps.create_droplet.outputs.droplet_ip }}
     
     steps:
       - name: Checkout repository
@@ -260,21 +293,3 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Tags:** odoo, production, managed-by-github" >> $GITHUB_STEP_SUMMARY
           fi
-
-      - name: Save droplet info to repository (optional)
-        if: steps.check_droplet.outputs.exists == 'false'
-        run: |
-          mkdir -p infrastructure
-          cat > infrastructure/droplet-info.json <<EOF
-          {
-            "droplet_name": "${{ github.event.inputs.droplet_name }}",
-            "droplet_id": "${{ steps.create_droplet.outputs.droplet_id }}",
-            "droplet_ip": "${{ steps.create_droplet.outputs.droplet_ip }}",
-            "droplet_size": "${{ github.event.inputs.droplet_size }}",
-            "droplet_region": "${{ github.event.inputs.droplet_region }}",
-            "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "tags": ["odoo", "production", "managed-by-github"]
-          }
-          EOF
-          
-          echo "Droplet information saved to infrastructure/droplet-info.json"
