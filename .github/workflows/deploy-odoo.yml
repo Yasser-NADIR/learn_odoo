@@ -1,0 +1,263 @@
+name: Deploy Odoo to DigitalOcean
+
+on:
+  workflow_dispatch:
+    inputs:
+      droplet_name:
+        description: 'Name of the droplet'
+        required: true
+        default: 'odoo-production'
+      droplet_size:
+        description: 'Droplet size (only used if creating new droplet)'
+        required: true
+        default: 's-4vcpu-8gb'
+        type: choice
+        options:
+          - 's-2vcpu-4gb'
+          - 's-4vcpu-8gb'
+          - 's-4vcpu-16gb'
+          - 's-8vcpu-16gb'
+      droplet_region:
+        description: 'Droplet region (only used if creating new droplet)'
+        required: true
+        default: 'nyc1'
+        type: choice
+        options:
+          - 'nyc1'
+          - 'nyc3'
+          - 'sfo3'
+          - 'ams3'
+          - 'sgp1'
+          - 'lon1'
+          - 'fra1'
+          - 'tor1'
+      force_recreate:
+        description: 'Force recreate deployment (clean install)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  ensure-droplet:
+    # Call create-droplet workflow which handles existence check
+    uses: ./.github/workflows/create-droplet.yml
+    with:
+      droplet_name: ${{ github.event.inputs.droplet_name }}
+      droplet_size: ${{ github.event.inputs.droplet_size }}
+      droplet_region: ${{ github.event.inputs.droplet_region }}
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+  deploy:
+    needs: ensure-droplet
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Get droplet information
+        id: get_droplet
+        run: |
+          # Get droplet IP and ID from ensure-droplet job
+          DROPLET_IP="${{ needs.ensure-droplet.outputs.droplet_ip }}"
+          DROPLET_ID="${{ needs.ensure-droplet.outputs.droplet_id }}"
+          
+          echo "droplet_ip=$DROPLET_IP" >> $GITHUB_OUTPUT
+          echo "droplet_id=$DROPLET_ID" >> $GITHUB_OUTPUT
+          
+          echo "Droplet IP: $DROPLET_IP"
+          echo "Droplet ID: $DROPLET_ID"
+
+      - name: Copy config files to droplet
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ steps.get_droplet.outputs.droplet_ip }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "config/odoo.conf"
+          target: "/root/odoo/"
+          strip_components: 1
+
+      - name: Copy custom addons to droplet (if exists)
+        if: hashFiles('addons/**') != ''
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ steps.get_droplet.outputs.droplet_ip }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "addons/*"
+          target: "/root/odoo/"
+
+      - name: Setup Docker context for remote deployment
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          DROPLET_IP="${{ steps.get_droplet.outputs.droplet_ip }}"
+          DROPLET_NAME="${{ github.event.inputs.droplet_name }}"
+          
+          # Setup SSH key for Docker context
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H $DROPLET_IP >> ~/.ssh/known_hosts 2>/dev/null
+          
+          # Create Docker context pointing to remote droplet
+          docker context create "$DROPLET_NAME" \
+            --docker "host=ssh://root@$DROPLET_IP"
+          
+          # Switch to remote context
+          docker context use "$DROPLET_NAME"
+          
+          # Verify connection
+          docker info
+          
+          echo "✅ Docker context configured for remote deployment"
+
+      - name: Deploy Odoo using Docker Compose
+        run: |
+          FORCE_RECREATE="${{ github.event.inputs.force_recreate }}"
+          
+          echo "Deploying Odoo to remote droplet..."
+          
+          if [ "$FORCE_RECREATE" = "true" ]; then
+            echo "Force recreate enabled - removing volumes..."
+            docker compose down -v
+          fi
+          
+          # Pull latest images
+          docker compose pull
+          
+          # Deploy Odoo
+          docker compose up -d
+          
+          # Wait for Odoo to start
+          echo "Waiting for Odoo to start..."
+          sleep 15
+          
+          # Check status
+          docker compose ps
+          
+          # Check if Odoo container is running
+          if docker compose ps | grep -q "odoo.*Up"; then
+            echo "✅ Odoo deployed successfully!"
+          else
+            echo "❌ Odoo failed to start"
+            docker compose logs odoo
+            exit 1
+          fi
+
+      - name: Display Odoo logs
+        if: always()
+        run: |
+          echo "Last 50 lines of Odoo logs:"
+          docker compose logs --tail=50 odoo
+
+      - name: Verify deployment
+        run: |
+          DROPLET_IP="${{ steps.get_droplet.outputs.droplet_ip }}"
+          
+          echo "Verifying Odoo deployment..."
+          
+          # Wait a bit more for Odoo to be fully ready
+          sleep 10
+          
+          # Check if Odoo web interface is accessible
+          MAX_ATTEMPTS=10
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Health check attempt $ATTEMPT of $MAX_ATTEMPTS..."
+            
+            if curl -f -s -o /dev/null -w "%{http_code}" http://$DROPLET_IP:8069/web/database/selector | grep -q "200\|303"; then
+              echo "✅ Odoo is accessible and responding!"
+              break
+            fi
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "⚠️ Warning: Could not verify Odoo accessibility"
+              echo "This might be due to firewall rules or Odoo still initializing"
+              echo "Please check manually: http://$DROPLET_IP:8069"
+            fi
+            
+            sleep 5
+          done
+
+      - name: Display deployment summary
+        if: always()
+        run: |
+          DROPLET_IP="${{ steps.get_droplet.outputs.droplet_ip }}"
+          DROPLET_ID="${{ steps.get_droplet.outputs.droplet_id }}"
+          FORCE_RECREATE="${{ github.event.inputs.force_recreate }}"
+          
+          echo "## 🚀 Odoo Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Droplet Information:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Name: ${{ github.event.inputs.droplet_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ID: $DROPLET_ID" >> $GITHUB_STEP_SUMMARY
+          echo "- IP: $DROPLET_IP" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Type:**" >> $GITHUB_STEP_SUMMARY
+          if [ "$FORCE_RECREATE" = "true" ]; then
+            echo "- Clean installation (data volumes removed)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Update/restart (data preserved)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 Access Odoo" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Web Interface:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "http://$DROPLET_IP:8069" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 Management Commands" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**SSH into droplet:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "ssh root@$DROPLET_IP" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**View logs:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "ssh root@$DROPLET_IP 'cd /root/odoo && docker-compose logs -f odoo'" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Restart Odoo:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "ssh root@$DROPLET_IP 'cd /root/odoo && docker-compose restart odoo'" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Stop Odoo:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "ssh root@$DROPLET_IP 'cd /root/odoo && docker-compose down'" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "$FORCE_RECREATE" = "true" ]; then
+            echo "1. Access Odoo at http://$DROPLET_IP:8069" >> $GITHUB_STEP_SUMMARY
+            echo "2. Create a new database" >> $GITHUB_STEP_SUMMARY
+            echo "3. Configure your Odoo instance" >> $GITHUB_STEP_SUMMARY
+            echo "4. Install required apps/modules" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "1. Verify Odoo is working: http://$DROPLET_IP:8069" >> $GITHUB_STEP_SUMMARY
+            echo "2. Check logs if any issues" >> $GITHUB_STEP_SUMMARY
+            echo "3. Test your applications" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed at:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Remove SSH key from runner
+          rm -f ~/.ssh/id_ed25519 || true
